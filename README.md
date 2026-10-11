@@ -7,6 +7,8 @@
 - **回放查**：选一段录像 → 重量增强 → 播放（慢一点没关系）。
 - **不用登录**：服务只绑 `127.0.0.1`，打开即用。
 
+当前版本 `0.9.0`。
+
 ---
 
 ## 主要能力
@@ -20,41 +22,94 @@
 | 离线 AI 权重 | 已接入 Real-ESRGAN general-x4v3（4× 超分）；**缺失阶段自动回退经典算法** |
 | 对比与全屏 | 点画面全屏；每路「对比」看 *原图 vs 增强* |
 | 系统内网安全 | Argon2 + JWT + RBAC + 审计（运维面板）；输出流鉴权 |
+| 纯本地界面 | `static/*.html` 零 CDN、零外链，断网可用 |
+
+## 环境要求
+
+- **Python ≥ 3.10**（开发验证于 3.12）
+- Linux / Windows / macOS
+- 重量增强（`forensic`）需要 `onnxruntime`；实时档只用 OpenCV，无 GPU 也能跑
+
+## 快速开始
+
+### 1. 取代码
+
+```bash
+git clone https://github.com/Logic922/CampusClear.git
+cd CampusClear
+```
+
+### 2. 装依赖
+
+**普通文件系统（推荐，用 venv）：**
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+```
+
+**exfat / 不支持符号链接的分区**（venv 会创建 `lib64` 符号链接而失败），
+改用 `pip --target` 装到一个普通目录：
+
+```bash
+pip install -r requirements.txt --target pylibs
+```
+
+`pylibs/` 是**本地生成**的目录，**不在本仓库里**（见下方「本仓库不包含什么」）。
+只要它存在，`run_client.sh` / `run_tests.sh` 会自动用 `PYTHONPATH` 指过去，
+等价于一个「无符号链接的虚拟环境」。
+
+> 没有 NVIDIA 显卡的机器：把 `requirements.txt` 里的 `onnxruntime-gpu`
+> 换成 `onnxruntime`（两者互斥），或改用 `pip install -e ".[cpu]"`。
+
+### 3. 启动
+
+```bash
+./run_client.sh                # 启动并自动打开界面
+./run_client.sh --no-window    # 只起本地服务，不弹浏览器
+./run_client.sh --port 9000
+```
+
+等价于：
+
+```bash
+PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m campusclear.app
+```
+
+客户端参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--host` | 默认 `127.0.0.1`。**勿改为对外地址** |
+| `--port` | 默认 `8000` |
+| `--data-dir` | 录像 / 输出 / 数据库目录 |
+| `--models-dir` | ONNX 权重目录（重量增强用） |
+| `--no-window` | 不自动打开界面 |
+| `--url-only` | 只打印地址后退出（调试用） |
+
+### 4. 跑测试
+
+```bash
+pip install -r requirements-dev.txt --target pylibs   # pytest + httpx
+./run_tests.sh
+```
 
 ## 目录结构
 
 ```
 src/campusclear/     核心代码
-  app.py             桌面启动器（也是打包入口）
-  main.py            FastAPI 入口
-  api/               client.py（客户端接口）、routes.py（运维接口）
-  core/              取流/分析/决策/增强/回放/来源/调度...
-  static/            client.html（老师客户端，纯本地零 CDN）
-tests/               测试（含客户端接口、取流来源、增强器）
-tools/               探测、试机、取证增强、权重校验、打包
+  app.py             桌面启动器（程序入口，也是打包入口）
+  main.py            FastAPI 应用（/ 运维面板、/client 客户端、/api/v1 运维接口）
+  config.py          配置（环境变量 CAMPUSCLEAR_*）
+  api/               client.py（客户端接口）、routes.py + schemas.py（运维接口）
+  auth/              Argon2 + JWT + RBAC
+  core/              取流 / 分析 / 决策 / 增强 / 回放 / 来源 / 调度 / 快照 / 存储
+  models/            ONNX 权重注册与完整性校验
+  static/            client.html（老师客户端）、dashboard.html（运维面板），零 CDN
+tests/               10 个测试模块 + conftest：客户端接口 / 取流来源 / 增强器 / 规划 / 存储 / 认证 …
+tools/               探测、试机、取证增强、权重校验、打包辅助
 models/              离线权重 + models_manifest.json
-packaging/           AppImage 构建（spec + 脚本）
-pylibs/              exfat 上用的依赖（pip --target，无符号链接）
-CampusClear-x86_64.AppImage   打包好的可执行程序
-```
-
-## 快速开始
-
-**直接运行（推荐）**
-```bash
-./CampusClear-x86_64.AppImage          # 双击亦可，自动打开界面
-```
-
-**从源码运行**（本目录在 exfat 上，用 pylibs 而非 venv）
-```bash
-./run_client.sh          # 启动客户端
-./run_tests.sh           # 跑测试
-./run_client.sh --port 9000 --no-window
-```
-
-**打包**
-```bash
-bash packaging/build.sh   # 需在装有 pyinstaller 的环境；见 packaging/campusclear.spec
+packaging/           PyInstaller 打包配置（spec）与一键脚本
 ```
 
 ## 离线权重
@@ -68,23 +123,52 @@ bash packaging/build.sh   # 需在装有 pyinstaller 的环境；见 packaging/c
 | lowlight / denoise / deblur | — | 未接入，**自动回退经典算法** |
 
 ```bash
-python tools/verify_models.py --models-dir models                 # 校验
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+python tools/verify_models.py --models-dir models                  # 校验
 python tools/verify_models.py --models-dir models --write-manifest # 回填哈希
 ```
 
 ## 取流与探测
 
+`tools/` 下的脚本都 import `campusclear`，先设好 `PYTHONPATH`：
+
 ```bash
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+
 python tools/probe_source.py --methods
 python tools/probe_source.py --url "rtsp://user:pass@10.0.0.5:554/Streaming/Channels/101"
 python tools/probe_source.py --brand hikvision --host 10.0.0.5 --user admin --password xxx --sub
+python tools/offline_trial.py     # 离线试机：不接摄像头、不需 GPU，直接看增强效果
 ```
 
-## 测试
+## 打包
 
 ```bash
-./run_tests.sh            # 全绿（客户端接口 / 取流来源 / 增强器 / 规划 / 存储 / 认证 …）
+bash packaging/build.sh
 ```
+
+产物是 **PyInstaller onedir**：`dist/CampusClear/`，双击 `CampusClear` 即可启动。
+Windows 上请在 Windows 环境执行同样的命令（PyInstaller 不能跨平台交叉编译）。
+体积主要由 `onnxruntime` + `opencv` 决定；不用重量 AI 时可从
+`packaging/campusclear.spec` 的 `collect_submodules` 里去掉 `onnxruntime` 显著瘦身。
+
+> 体积较大的单文件分发物（AppImage 等）走 **GitHub Releases 附件**，不入库。
+
+## 本仓库不包含什么
+
+| 内容 | 大小 | 原因 |
+| --- | --- | --- |
+| `pylibs/` | ~337 MB | `pip --target` 生成的本地依赖，第三方二进制不随源码入库；按上面「装依赖」自行生成 |
+| `CampusClear-x86_64.AppImage` 等打包产物 | ~112 MB | 超过 GitHub 单文件 100 MB 硬上限；走 Releases 分发 |
+| `data/` | — | 运行时目录（日志 / 快照 / 缓存），含现场数据，不入库 |
+| `.env` | — | 本地密钥与现场配置，请从 `.env.example` 复制 |
+
+## 环境变量
+
+所有配置项以 `CAMPUSCLEAR_` 开头，未设置的用代码内默认值。
+完整列表见 [`.env.example`](.env.example)：服务监听、TLS 自签证书、
+JWT/初始管理员、`data`/`models`/日志目录、执行提供器优先级与分块推理、
+流与调度（最大路数、队列、推理/输出帧率、回推地址）等。
 
 ## 说明与边界
 
