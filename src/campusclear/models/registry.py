@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -78,6 +80,10 @@ class ModelRegistry:
         self.specs: dict[str, ModelSpec] = {}
         self._sessions: dict[str, LoadedModel] = {}
         self._manifest: dict = {}
+        # 会话创建要读几十 MB 权重、校验 SHA256，TensorRT 还会编译 engine，
+        # 可能持续几十秒。多路首帧并发时若 check-then-act 无锁，同一阶段会被
+        # 建出多个会话（显存翻倍甚至 OOM），且后建的会覆盖先建的。
+        self._load_lock = threading.Lock()
         self.load_manifest()
 
     # ------------------------------------------------------------------ #
@@ -107,7 +113,18 @@ class ModelRegistry:
             )
 
     def available_stages(self) -> list[str]:
-        return [stage for stage in STAGES if stage in self.specs]
+        """真正**可用**的阶段：清单里有、权重文件在、onnxruntime 也装上了。
+
+        只检查清单会把「有清单没权重」误判为可走 ONNX，随后每帧每阶段都
+        尝试 get() → 权重缺失 → 回退经典算法，日志被刷爆且推理链路名不副实。
+        """
+        if importlib.util.find_spec("onnxruntime") is None:
+            return []
+        return [
+            stage
+            for stage in STAGES
+            if stage in self.specs and (self.models_dir / self.specs[stage].file).is_file()
+        ]
 
     # ------------------------------------------------------------------ #
     # 校验
@@ -139,21 +156,34 @@ class ModelRegistry:
     # 会话
     # ------------------------------------------------------------------ #
     def get(self, stage: str) -> LoadedModel | None:
-        """取得（必要时创建）某阶段的推理会话。权重不可用时返回 None。"""
-        if stage in self._sessions:
-            return self._sessions[stage]
-        spec = self.specs.get(stage)
-        if spec is None:
-            return None
-        path = self.models_dir / spec.file
-        if not path.exists():
-            logger.warning("阶段 %s 权重缺失（%s），跳过该阶段", stage, path)
-            return None
-        if self.verify_hash and spec.sha256:
-            if sha256_of(path) != spec.sha256:
-                # 这里刻意抛异常：内网安全项目里，"权重被换过" 属于必须人工介入的严重事件
-                raise ModelIntegrityError(f"阶段 {stage} 权重哈希校验失败: {spec.file}")
+        """取得（必要时创建）某阶段的推理会话。权重不可用时返回 None。
 
+        整个「检查—创建—登记」过程在同一把锁内完成。不同阶段也会串行加载，
+        这只发生在首次命中时；换来的确定性是：多路同时首帧不会创建重复会话。
+        """
+        with self._load_lock:
+            if stage in self._sessions:
+                return self._sessions[stage]
+            spec = self.specs.get(stage)
+            if spec is None:
+                return None
+            path = self.models_dir / spec.file
+            if not path.exists():
+                logger.warning("阶段 %s 权重缺失（%s），跳过该阶段", stage, path)
+                return None
+            if self.verify_hash and spec.sha256:
+                if sha256_of(path) != spec.sha256:
+                    # 这里刻意抛异常：内网安全项目里，"权重被换过" 属于必须人工介入的严重事件
+                    raise ModelIntegrityError(f"阶段 {stage} 权重哈希校验失败: {spec.file}")
+
+            loaded = self._load_session(spec, path)
+            if loaded is not None:
+                self._sessions[stage] = loaded
+            return loaded
+
+    def _load_session(self, spec: ModelSpec, path: Path) -> LoadedModel | None:
+        """真正创建 ORT 会话（调用方必须持有 ``_load_lock``）。"""
+        stage = spec.stage
         try:
             import onnxruntime as ort
         except ImportError:  # pragma: no cover - 取决于运行环境
@@ -184,7 +214,6 @@ class ModelRegistry:
             loaded.provider,
             loaded.input_shape,
         )
-        self._sessions[stage] = loaded
         return loaded
 
     def _resolve_providers(self, ort) -> list[str]:
@@ -201,7 +230,8 @@ class ModelRegistry:
             if spec is None:
                 rows.append({"stage": stage, "state": "未配置", "provider": None})
                 continue
-            loaded = self._sessions.get(stage)
+            with self._load_lock:
+                loaded = self._sessions.get(stage)
             rows.append(
                 {
                     "stage": stage,
@@ -217,7 +247,8 @@ class ModelRegistry:
         return rows
 
     def close(self) -> None:
-        self._sessions.clear()
+        with self._load_lock:
+            self._sessions.clear()
 
 
 _PROVIDER_PRIORITY = [
