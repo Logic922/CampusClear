@@ -15,6 +15,8 @@ import subprocess
 
 import numpy as np
 
+from ..compat import encoder_usable, popen_kwargs
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,11 +80,18 @@ class RtspPusher:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             bufsize=self.width * self.height * 3,
+            **popen_kwargs(),           # Windows 下隐藏 ffmpeg 控制台窗口
         )
 
     def _encoder_args(self) -> list[str]:
-        """选择编码器。硬件编码不可用时由 FFmpeg 自身回退到软件编码。"""
-        if self.prefer_hardware:
+        """选择编码器。
+
+        这里必须先探测再选择，不能靠「让 FFmpeg 自己回退」：
+        FFmpeg 遇到构建里不存在的编码器是**直接报错退出**，不是降级到软件编码。
+        而「构建里有 h264_nvenc」也不等于「本机能用」——没有 N 卡的机器上
+        一调用就报「Cannot load nvcuda.dll」。因此用 encoder_usable 做真实验证。
+        """
+        if self.prefer_hardware and encoder_usable(self.ffmpeg_bin, "h264_nvenc"):
             self.encoder = "h264_nvenc"
             return [
                 "-c:v", "h264_nvenc",
@@ -91,6 +100,8 @@ class RtspPusher:
                 "-rc", "cbr",
                 "-zerolatency", "1",
             ]
+        if self.prefer_hardware:
+            logger.info("未检测到 h264_nvenc（无 NVIDIA 编码器），回推改用 libx264 软件编码")
         self.encoder = "libx264"
         return [
             "-c:v", "libx264",
@@ -102,6 +113,20 @@ class RtspPusher:
     # ------------------------------------------------------------------ #
     def write(self, frame: np.ndarray) -> bool:
         """写入一帧。返回 False 表示管道不可用，需要重建。"""
+        # 最后一道尺寸防线：rawvideo 没有帧头，尺寸错了 ffmpeg 不会报错，
+        # 只会把字节流按错误的边界切开，表现为画面撕裂/跳段。宁可拒绝写帧，
+        # 也不要让错误尺寸污染整条输出流。
+        if frame.ndim != 3 or frame.shape[0] != self.height or frame.shape[1] != self.width:
+            self.write_failures += 1
+            logger.error(
+                "回推帧尺寸不匹配: 期望 %dx%d，实际 %s（%s）",
+                self.width,
+                self.height,
+                "x".join(str(v) for v in frame.shape[:2]) if frame.ndim >= 2 else "?",
+                self.target_url,
+            )
+            return False
+
         process = self._process
         if process is None or process.stdin is None:
             return False
