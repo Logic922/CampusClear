@@ -28,6 +28,7 @@ from .api.client import router as client_router
 from .api.routes import router
 from .auth.security import hash_password
 from .config import get_settings
+from .core.gateway import ensure_local_gateway
 from .core.scheduler import StreamSupervisor
 from .core.store import CameraStore
 from .models.registry import ModelIntegrityError, ModelRegistry
@@ -113,6 +114,12 @@ async def lifespan(app: FastAPI):
 
     _seed_admin(settings, store)
 
+    # 回推需要一个 RTSP 网关来接收。单机形态下没有网关时这里会明确说明并跳过，
+    # 而不是让每条通道各自去撞墙（以前表现为「日志一直报回推失败、播放器打不开」）。
+    gateway = ensure_local_gateway(settings)
+    if gateway.reason:
+        logger.info("回推网关: %s", gateway.reason)
+
     supervisor = StreamSupervisor(settings, store, registry)
     supervisor.start()
 
@@ -125,6 +132,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         supervisor.shutdown()
+        gateway.stop()
         logger.info("CampusClear 已停止")
 
 
