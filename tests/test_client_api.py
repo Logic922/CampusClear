@@ -181,6 +181,22 @@ def test_add_source_by_vendor_builds_url(client):
     assert "/Streaming/Channels/101" in cam.source_rtsp
 
 
+def test_add_source_rejects_bad_or_duplicate_id(client):
+    bad = client.post("/api/v1/client/sources", json={
+        "id": "../evil", "url": "rtsp://10.0.0.9:554/live",
+    })
+    assert bad.status_code == 400
+
+    first = client.post("/api/v1/client/sources", json={
+        "id": "src_fixed", "url": "rtsp://10.0.0.9:554/live",
+    })
+    assert first.status_code == 201
+    duplicate = client.post("/api/v1/client/sources", json={
+        "id": "src_fixed", "url": "rtsp://10.0.0.10:554/other",
+    })
+    assert duplicate.status_code == 409
+
+
 # --------------------------------------------------------------------------- #
 # 截图增强
 # --------------------------------------------------------------------------- #
@@ -208,3 +224,75 @@ def test_snapshot_unknown_stream_404(client):
 
 def test_snapshot_name_traversal_rejected(client):
     assert client.get("/api/v1/client/snapshots/..%2f..%2fetc%2fpasswd").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 截图：抓帧来源与串行队列
+# ---------------------------------------------------------------------------
+
+def test_grab_frame_uses_pipeline_not_new_rtsp_session(client, monkeypatch):
+    """默认抓帧必须复用管线内存帧，不能为了截一张图去新开一路 RTSP。
+
+    这是现场「点截图卡很久」的主因：真实海康的并发会话有上限，新开连接要等
+    握手和关键帧，还会把正在预览的那一路挤掉。
+    """
+    import types
+
+    import cv2
+    import numpy as np
+
+    from campusclear.api import client as client_module
+    from campusclear.core.camera import CameraConfig
+
+    store = client.app.state.store
+    store.upsert_camera(CameraConfig(
+        id="grab_01", name="抓帧", source_rtsp="rtsp://u:p@10.0.0.5:554/Streaming/Channels/102",
+        enabled=False,
+    ))
+
+    class _FakePipeline:
+        def snapshot_raw_jpeg(self) -> bytes:
+            ok, buf = cv2.imencode(".jpg", np.full((48, 64, 3), 120, np.uint8))
+            assert ok
+            return buf.tobytes()
+
+    opened: list[str] = []
+    monkeypatch.setattr(client_module, "_supervisor",
+                        lambda request: types.SimpleNamespace(get_pipeline=lambda sid: _FakePipeline()))
+    monkeypatch.setattr(client_module, "_grab_jpeg_from_url",
+                        lambda url, ffmpeg_bin, timeout=8.0: opened.append(url) or None)
+
+    try:
+        r = client.post("/api/v1/client/snapshot", json={"stream_id": "grab_01", "preset": "light"})
+        assert r.status_code == 201, r.text
+        assert opened == []                     # 没有新开 RTSP 会话
+        assert r.json()["source_size"] == "64x48"
+    finally:
+        store.delete_camera("grab_01")
+
+
+def test_snapshot_async_returns_immediately_and_completes(client):
+    """wait=false：立刻返回任务 id，结果通过轮询拿到（连点不阻塞界面）。"""
+    import time as _time
+
+    r = client.post("/api/v1/client/snapshot",
+                    json={"stream_id": "demo", "preset": "light", "wait": False})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["queued"] is True and body["id"]
+
+    job = {}
+    deadline = _time.time() + 20
+    while _time.time() < deadline:
+        job = client.get(f"/api/v1/client/snapshot-jobs/{body['id']}").json()
+        if job["state"] in ("done", "failed"):
+            break
+        _time.sleep(0.2)
+
+    assert job["state"] == "done", job
+    assert job["elapsed_ms"] >= 0
+    assert client.get(job["result"]["url"]).status_code == 200
+
+
+def test_snapshot_job_unknown_is_404(client):
+    assert client.get("/api/v1/client/snapshot-jobs/not-a-job").status_code == 404
