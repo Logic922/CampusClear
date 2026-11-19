@@ -59,7 +59,7 @@ class CameraCreate(CameraBase):
 
 class CameraUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=64)
-    source_rtsp: str | None = None
+    source_rtsp: str | None = Field(default=None, min_length=8, max_length=512)
     location: str | None = None
     enabled: bool | None = None
     width: int | None = Field(default=None, ge=64, le=8192)
@@ -73,6 +73,17 @@ class CameraUpdate(BaseModel):
     roi_enabled: bool | None = None
     notes: str | None = None
     tags: list[str] | None = None
+
+    @field_validator("source_rtsp")
+    @classmethod
+    def check_scheme(cls, value: str | None) -> str | None:
+        """PATCH 与 POST 必须遵守同一套取流协议白名单。"""
+        if value is None:
+            return None
+        allowed = ("rtsp://", "rtsps://", "rtmp://")
+        if not value.lower().startswith(allowed):
+            raise ValueError(f"视频源必须以下列协议开头: {', '.join(allowed)}")
+        return value
 
 
 class CameraView(BaseModel):
