@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 
 from .camera import CameraConfig, ResolvedCamera
+from .gateway import rtsp_endpoint_reachable
 from .ingest import RtspReader
 from .metrics import StreamMetrics
 from .output import RtspPusher
@@ -57,6 +58,10 @@ class StreamPipeline:
     ) -> None:
         self.resolved = resolved
         self.camera: CameraConfig = resolved.camera
+        # 输出尺寸的**唯一口径**：一旦启动就不允许逐帧变化。
+        # rawvideo 管道按固定帧长读取，ECONOMY/SAFE 档即使把 SR 倍率降到 1，
+        # 也必须把最终画布补回这个倍率，否则推流端会把相邻两帧拼成一帧。
+        self.output_scale = resolved.scale if resolved.enable_sr else 1
         self.settings = settings
         self.enhancer = enhancer
         self.governor = governor
@@ -86,9 +91,18 @@ class StreamPipeline:
             width=self.camera.width,
             height=self.camera.height,
             fps=self.camera.fps,
+            transport=getattr(settings, "rtsp_transport", "tcp"),
             reconnect_backoff=tuple(settings.reconnect_backoff_seconds),
+            force_size=getattr(settings, "force_decode_size", True),
+            max_width=getattr(settings, "max_decode_width", 0),
+            max_height=getattr(settings, "max_decode_height", 0),
         )
         self.pusher: RtspPusher | None = None
+        # 回推重建退避：目标不可达时绝不能每帧重建 ffmpeg 进程
+        self._push_backoff = 1.0
+        self._push_retry_at = 0.0
+        # 没有 RTSP 网关时只警告一次，并按 5 分钟慢重试（现场可能后补网关）
+        self._gateway_missing_logged = False
 
         self._queue: queue.Queue = queue.Queue(maxsize=settings.queue_size)
         self._threads: list[threading.Thread] = []
@@ -97,10 +111,23 @@ class StreamPipeline:
         self._last_output: np.ndarray | None = None
         self._last_raw: np.ndarray | None = None
         self._frame_lock = threading.Lock()
+        # MJPEG 快照缓存：同一帧被多个观看者请求时只编码一次。
+        # 顺序号分「原图/增强」两路，静止复用时不递增增强序号，
+        # 这样复用旧帧期间缓存始终命中，不会每 66ms 重编码一次。
+        self._raw_seq = 0
+        self._output_seq = 0
+        self._jpeg_lock = threading.Lock()
+        self._jpeg_cache: dict[tuple[bool, int], tuple[int, bytes]] = {}
         self._last_infer_at = 0.0
         self._infer_interval = 1.0 / max(1, settings.infer_fps)
         self._frozen_counter = 0
         self._last_signature: bytes | None = None
+        self._first_frame_logged = False
+        # 画面冻结重连请求：worker 线程检测到冻结后**不能直接杀 ffmpeg 进程**
+        # ——那会让 reader 线程正在 read 的管道突然 EOF，两条线程各自走重连逻辑，
+        # 互相覆盖 open() 出来的新进程，形成竞态。改为设标记，由 reader 线程
+        # 统一在循环顶部消费。
+        self._frozen_reconnect_requested = False
 
     # ------------------------------------------------------------------ #
     # 生命周期
@@ -108,7 +135,19 @@ class StreamPipeline:
     def start(self) -> None:
         if self.state.running:
             return
-        self._stop_event.clear()
+        # 每次启动换一个新的 Event，线程持有自己那一轮的引用。
+        # 这样即使上一轮 worker 卡在长推理里、join 超时后才醒来，它看到的
+        # 仍是「已停止」的旧事件，不会和新一轮线程一起往队列/推流器写帧。
+        self._stop_event = threading.Event()
+        self._push_backoff = 1.0
+        self._push_retry_at = 0.0
+        self._frozen_reconnect_requested = False
+        # 健康检查按「本次启动」计时：重启后从零开始观察，避免拿着上一轮
+        # 的 last_frame_at 立刻又触发一次重启。
+        self.metrics.started_at = time.time()
+        self.metrics.last_frame_at = 0.0
+        self._first_frame_logged = False
+        self.reader.resume()
 
         probe = self.reader.probe()
         if probe is not None:
@@ -122,9 +161,20 @@ class StreamPipeline:
         self.reader.open()
         self.state.connected = True
 
+        stop_event = self._stop_event
         self._threads = [
-            threading.Thread(target=self._reader_loop, name=f"cc-read-{self.camera.id}", daemon=True),
-            threading.Thread(target=self._worker_loop, name=f"cc-work-{self.camera.id}", daemon=True),
+            threading.Thread(
+                target=self._reader_loop,
+                args=(stop_event,),
+                name=f"cc-read-{self.camera.id}",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._worker_loop,
+                args=(stop_event,),
+                name=f"cc-work-{self.camera.id}",
+                daemon=True,
+            ),
         ]
         for thread in self._threads:
             thread.start()
@@ -132,13 +182,14 @@ class StreamPipeline:
         logger.info("通道 %s 已启动", self.camera.id)
 
     def stop(self, timeout: float = 5.0) -> None:
-        if not self.state.running:
-            return
+        """停止通道。可重复调用，也覆盖「start 中途失败」的清理场景。"""
+        # 先停 reader：它会置停止标志并 terminate ffmpeg，从而立刻打断
+        # 阻塞读和退避等待；否则 join 只能干等 5 秒，然后旧线程又自己重连。
         self._stop_event.set()
+        self.reader.stop()
         for thread in self._threads:
             thread.join(timeout=timeout)
         self._threads.clear()
-        self.reader.close()
         if self.pusher is not None:
             self.pusher.close()
         self.state.running = False
@@ -147,6 +198,10 @@ class StreamPipeline:
         with self._frame_lock:
             self._last_output = None
             self._last_raw = None
+            self._raw_seq += 1
+            self._output_seq += 1
+        with self._jpeg_lock:
+            self._jpeg_cache.clear()
         logger.info("通道 %s 已停止", self.camera.id)
 
     def restart(self) -> None:
@@ -155,21 +210,46 @@ class StreamPipeline:
         self.analyzer.reset()
         self._last_signature = None
         self._frozen_counter = 0
+        self._frozen_reconnect_requested = False
         self.start()
 
     # ------------------------------------------------------------------ #
     # 输出配置
     # ------------------------------------------------------------------ #
-    def _configure_output(self) -> None:
-        scale = self.resolved.scale if self.resolved.enable_sr else 1
-        out_width = self.reader.width * scale
-        out_height = self.reader.height * scale
+    def _configure_output(self) -> bool:
+        """建立回推器。返回 True 表示「因目标没有 RTSP 网关而主动跳过」。
+
+        跳过与失败要区分开：没有网关是**部署形态问题**（单机客户端本来就没有
+        网关），不该按退避节奏反复重连；网关在但推流被拒才是需要重试的故障。
+        """
+        # 单机客户端形态：内网没有 RTSP 网关，回推必然失败。
+        # 直接不建推流器，画面仍通过 _last_output 走 MJPEG 提供给浏览器。
+        if not getattr(self.settings, "output_enabled", True):
+            self.pusher = None
+            self.state.output_ready = False
+            return False
+        out_width = self.reader.width * self.output_scale
+        out_height = self.reader.height * self.output_scale
         target = f"{self.settings.rtsp_output_base}/{self.camera.output_name}"
+        if not rtsp_endpoint_reachable(target):
+            self.pusher = None
+            self.state.output_ready = False
+            if not self._gateway_missing_logged:
+                self._gateway_missing_logged = True
+                logger.warning(
+                    "通道 %s 回推跳过：%s 上没有 RTSP 网关（浏览器观看与截图不受影响；"
+                    "需要回推时把 mediamtx 放进 bin/ 或设 CAMPUSCLEAR_RTSP_OUTPUT_BASE 指向已有网关）",
+                    self.camera.id, self.settings.rtsp_output_base,
+                )
+            return True
+        # 用探测到的真实源帧率，而不是配置默认的 25：15fps 的流按 25fps
+        # 打时间戳会让回放速度偏快。
+        source_fps = max(1, int(round(self.reader.fps or self.resolved.fps)))
         self.pusher = RtspPusher(
             target,
             width=out_width,
             height=out_height,
-            fps=self.resolved.fps,
+            fps=source_fps,
             bitrate_kbps=self._suggest_bitrate(out_width, out_height),
             ffmpeg_bin=self.settings.ffmpeg_bin,
             username=self.settings.rtsp_output_user,
@@ -182,6 +262,46 @@ class StreamPipeline:
             self.state.output_ready = False
             self.metrics.last_error = f"回推启动失败: {exc}"
             logger.error("通道 %s 回推启动失败: %s", self.camera.id, exc)
+        return False
+
+    def _ensure_output(self) -> None:
+        """按需建立/重建回推，失败走指数退避。
+
+        这里是「实时清晰化」能不能长期稳定运行的关键：FFmpeg 推流失败是**常事**
+        （网关重启、网络抖动、目标地址写错），而原实现在写帧失败后会立刻重建，
+        25fps 下等于每秒创建 25 个 ffmpeg 进程 —— 机器会被瞬间打死，
+        连 MJPEG 出图都会一起卡住。改为退避后，最坏情况是「回推暂时不可用」，
+        实时预览始终不受影响。
+        """
+        if not getattr(self.settings, "output_enabled", True):
+            return
+        now = time.monotonic()
+        if self.pusher is not None and self.pusher.alive:
+            return
+        if self._push_retry_at and now < self._push_retry_at:
+            return
+
+        if self._configure_output():
+            # 没有网关：不是故障，是部署形态。5 分钟后再看一眼，
+            # 现场补上网关后能自动恢复，同时避免每 60 秒空拉一次 ffmpeg。
+            self._push_retry_at = now + 300.0
+            return
+        if self.state.output_ready and self.pusher is not None and self.pusher.alive:
+            self._push_backoff = 1.0
+            self._push_retry_at = 0.0
+        else:
+            self._push_backoff = min(60.0, self._push_backoff * 2)
+            self._push_retry_at = now + self._push_backoff
+
+    def _note_push_failure(self, reason: str) -> None:
+        """记录一次回推失败并进入退避窗口。"""
+        self.metrics.last_error = reason
+        if self.pusher is not None:
+            self.pusher.close()
+        self.state.output_ready = False
+        self._push_backoff = min(60.0, self._push_backoff * 2)
+        self._push_retry_at = time.monotonic() + self._push_backoff
+        logger.warning("通道 %s 回推失败（%s），%.0fs 后重试", self.camera.id, reason, self._push_backoff)
 
     @staticmethod
     def _suggest_bitrate(width: int, height: int) -> int:
@@ -197,15 +317,22 @@ class StreamPipeline:
     # ------------------------------------------------------------------ #
     # reader 线程
     # ------------------------------------------------------------------ #
-    def _reader_loop(self) -> None:
-        while not self._stop_event.is_set():
+    def _reader_loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            # worker 线程检测到画面冻结时只设标记，重连动作由本线程统一执行：
+            # 避免两条线程同时 close/open 同一个 ffmpeg 进程的竞态。
+            if self._frozen_reconnect_requested:
+                self._frozen_reconnect_requested = False
+                self.metrics.last_error = "检测到画面冻结，触发重连"
+                self._frozen_counter = 0
+                self.analyzer.reset()
+                if not self._reconnect():
+                    continue
+
             if not self.reader.alive:
                 self.state.connected = False
-                self.metrics.reconnects += 1
-                if not self.reader.reconnect():
+                if not self._reconnect():
                     continue
-                self.state.connected = True
-                self.analyzer.reset()
 
             try:
                 frame = self.reader.read(timeout=3.0)
@@ -214,24 +341,33 @@ class StreamPipeline:
                 frame = None
 
             if frame is None:
+                if stop_event.is_set():
+                    break
                 self.metrics.last_error = self.reader.last_error or "读取失败"
                 self.state.connected = False
-                self._safe_reconnect()
+                self._reconnect()
                 continue
 
+            if not self._first_frame_logged:
+                logger.info(
+                    "通道 %s 首帧到达: %dx%d dtype=%s 均值=%.1f",
+                    self.camera.id, frame.shape[1], frame.shape[0],
+                    frame.dtype, float(frame.mean()),
+                )
+                self._first_frame_logged = True
             self.metrics.frames_read += 1
             self.metrics.last_frame_at = time.time()
             self._offer(frame)
 
-    def _safe_reconnect(self) -> None:
-        self.reader.close()
-        time.sleep(1.0)
-        try:
-            self.reader.open()
-            self.state.connected = True
-            self.analyzer.reset()
-        except OSError as exc:
-            self.metrics.last_error = f"重连失败: {exc}"
+    def _reconnect(self) -> bool:
+        """统一走 RtspReader 的指数退避（可被 stop() 立即打断）。"""
+        self.metrics.reconnects += 1
+        if not self.reader.reconnect():
+            self.metrics.last_error = self.reader.last_error or "重连失败"
+            return False
+        self.state.connected = True
+        self.analyzer.reset()
+        return True
 
     def _offer(self, frame: np.ndarray) -> None:
         """把帧放进队列；满则丢弃最旧的一帧。
@@ -257,8 +393,8 @@ class StreamPipeline:
     # ------------------------------------------------------------------ #
     # worker 线程
     # ------------------------------------------------------------------ #
-    def _worker_loop(self) -> None:
-        while not self._stop_event.is_set():
+    def _worker_loop(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
             try:
                 frame = self._queue.get(timeout=1.0)
             except queue.Empty:
@@ -271,21 +407,24 @@ class StreamPipeline:
                 logger.exception("通道 %s 处理异常", self.camera.id)
                 output = frame
 
-            if output is None:
+            # 推理可能几十秒；醒来后本通道可能已经停止/重启过。用本轮
+            # 线程持有的 stop_event 判断，避免旧 worker 往新管线里写帧。
+            if stop_event.is_set() or output is None:
                 continue
 
+            # 先更新对外快照：**无论回推是否可用，客户端 MJPEG 都必须拿到最新画面**。
+            # 这正是「单机客户端不依赖任何 RTSP 网关」的结构性保证。
+            # 静止复用返回的是同一个 ndarray，此时不递增序号，MJPEG 缓存可命中。
             with self._frame_lock:
-                self._last_output = output
+                if self._last_output is not output:
+                    self._last_output = output
+                    self._output_seq += 1
 
+            self._ensure_output()
             if self.pusher is None or not self.pusher.alive:
-                if self.pusher is not None and not self.pusher.restart():
-                    self.metrics.last_error = "回推不可用"
-                    continue
-                self._configure_output()
-
+                continue
             if not self.pusher.write(output):
-                self.metrics.last_error = "写帧失败，重建回推"
-                self.pusher.restart()
+                self._note_push_failure("写帧失败（推流目标不可达或编码进程退出）")
                 continue
             self.metrics.frames_written += 1
 
@@ -294,19 +433,25 @@ class StreamPipeline:
         # 留一份未增强的原始帧，供客户端「原图 / 增强」对比使用
         with self._frame_lock:
             self._last_raw = frame
+            self._raw_seq += 1
         quality = self.analyzer.analyze(frame)
 
         # ---- 画面冻结检测 ----
         # 老旧摄像头偶发「输出静止帧」故障（NVR 侧看起来在线，实际画面卡死）。
         # 用 8x8 缩略图的字节序列做指纹，连续多次相同即判定冻结。
+        # 注意：worker 线程**不能直接重连** —— 那会杀掉 reader 正在 read 的
+        # ffmpeg 进程，导致竞态。只设标记，由 reader 线程统一处理。
         signature = cv2.resize(frame, (8, 8), interpolation=cv2.INTER_AREA).tobytes()
         if signature == self._last_signature:
             self._frozen_counter += 1
             if self._frozen_counter >= self.settings.frozen_frame_restart_times:
-                self.metrics.last_error = "检测到画面冻结，触发重连"
+                logger.warning(
+                    "通道 %s 检测到画面冻结（连续 %d 帧相同），已请求重连",
+                    self.camera.id, self._frozen_counter,
+                )
+                self._frozen_reconnect_requested = True
                 self._frozen_counter = 0
                 self.analyzer.reset()
-                self._safe_reconnect()
         else:
             self._frozen_counter = 0
         self._last_signature = signature
@@ -328,14 +473,26 @@ class StreamPipeline:
         self.metrics.record_latency(time.perf_counter() - start)
 
         self.metrics.frames_enhanced += 1
-        # 兜底实现可能返回同尺寸结果，保证后续编码参数与实际帧一致
-        if output.shape[0] == frame.shape[0] and self.resolved.scale > 1 and plan.run_sr:
-            output = cv2.resize(
-                output,
-                (frame.shape[1] * self.resolved.scale, frame.shape[0] * self.resolved.scale),
-                interpolation=cv2.INTER_CUBIC,
-            )
-        return output
+        return self._match_output_size(frame, output)
+
+    def _match_output_size(self, frame: np.ndarray, output: np.ndarray) -> np.ndarray:
+        """把增强结果归一到启动时确定的输出画布。
+
+        这里必须覆盖三种情况，缺一都会让 rawvideo 帧长错位：
+        1. 模型原生倍率（如 4×）大于请求倍率（如 2×）→ 缩小；
+        2. 负载降档把 SR 关掉，enhancer 原样返回输入尺寸 → 补到输出倍率；
+        3. 兜底实现只返回同尺寸 → 补到输出倍率。
+        """
+        target_width = frame.shape[1] * self.output_scale
+        target_height = frame.shape[0] * self.output_scale
+        if (output.shape[1], output.shape[0]) == (target_width, target_height):
+            return output
+        interpolation = (
+            cv2.INTER_AREA if output.shape[1] > target_width else cv2.INTER_CUBIC
+        )
+        return cv2.resize(
+            output, (target_width, target_height), interpolation=interpolation
+        )
 
     def _should_reuse(self, plan: EnhancePlan) -> bool:
         """是否跳过本轮推理。"""
@@ -404,21 +561,44 @@ class StreamPipeline:
     # 对外
     # ------------------------------------------------------------------ #
     def snapshot_jpeg(self, quality: int = 85) -> bytes | None:
-        with self._frame_lock:
-            frame = self._last_output
-        if frame is None:
-            return None
-        ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-        return buffer.tobytes() if ok else None
+        return self.snapshot_jpeg_cached(raw=False, quality=quality)
 
     def snapshot_raw_jpeg(self, quality: int = 85) -> bytes | None:
         """未增强的原始帧（对比用）。"""
+        return self.snapshot_jpeg_cached(raw=True, quality=quality)
+
+    def snapshot_jpeg_cached(self, raw: bool = False, quality: int = 85) -> bytes | None:
+        """按帧序号缓存 JPEG 编码结果。
+
+        MJPEG 每个观看者都会高频取图；如果每人都独立 imencode，8 路 × 5 人
+        就是每秒数百次 1080p 编码。同一帧只编码一次，其余观看者直接拿缓存。
+        """
         with self._frame_lock:
-            frame = self._last_raw
+            frame = self._last_raw if raw else self._last_output
+            seq = self._raw_seq if raw else self._output_seq
         if frame is None:
             return None
-        ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-        return buffer.tobytes() if ok else None
+
+        key = (bool(raw), int(quality))
+        with self._jpeg_lock:
+            cached = self._jpeg_cache.get(key)
+            if cached is not None and cached[0] == seq:
+                return cached[1]
+
+        ok, buffer = cv2.imencode(
+            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+        )
+        if not ok:
+            return None
+        encoded = buffer.tobytes()
+
+        with self._jpeg_lock:
+            # 编码期间可能已有别的线程为同一帧完成编码，直接复用
+            cached = self._jpeg_cache.get(key)
+            if cached is not None and cached[0] == seq:
+                return cached[1]
+            self._jpeg_cache[key] = (seq, encoded)
+        return encoded
 
     def snapshot(self) -> dict:
         data = self.metrics.snapshot()
