@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from campusclear.auth.security import hash_password
@@ -206,6 +208,17 @@ def test_update_missing_camera_is_404(client, auth_headers):
     assert response.status_code == 404
 
 
+def test_update_camera_also_validates_source_scheme(client, auth_headers):
+    client.post("/api/v1/cameras", headers=auth_headers, json=VALID_CAMERA)
+    response = client.patch(
+        "/api/v1/cameras/gate_01",
+        headers=auth_headers,
+        json={"source_rtsp": "http://10.0.0.1/live.m3u8"},
+    )
+    assert response.status_code == 422
+    client.delete("/api/v1/cameras/gate_01", headers=auth_headers)
+
+
 def test_stats_for_non_running_camera_is_404(client, auth_headers):
     client.post("/api/v1/cameras", headers=auth_headers, json=VALID_CAMERA)
     response = client.get("/api/v1/cameras/gate_01/stats", headers=auth_headers)
@@ -266,3 +279,93 @@ def test_audit_records_login_and_admin_actions(client, auth_headers):
     logs = client.get("/api/v1/audit?limit=50", headers=auth_headers).json()
     actions = {row["action"] for row in logs}
     assert "login" in actions
+
+
+def test_streams_round_robin_view_ports(client, monkeypatch):
+    """多端口观看：view_port 必须在可用端口间轮转，避免全部挤主端口。"""
+    from campusclear.core.camera import CameraConfig
+
+    settings = client.app.state.settings
+    monkeypatch.setattr(settings, "active_view_ports", [8001, 8002, 8003])
+    store = client.app.state.store
+    for i in range(4):
+        store.upsert_camera(CameraConfig(
+            id=f"vp_{i}", name=f"vp{i}",
+            source_rtsp=f"rtsp://u:p@10.0.0.1:554/ch{i}", enabled=False,
+        ))
+    try:
+        data = client.get("/api/v1/client/streams").json()
+        by_id = {s["id"]: s["view_port"] for s in data["streams"]}
+        # 4 路摄像头 + demo，对 3 个端口轮转：8001,8002,8003,8001,(8002)
+        assert [by_id[f"vp_{i}"] for i in range(4)] == [8001, 8002, 8003, 8001]
+        assert all(v is not None for v in by_id.values())
+    finally:
+        for i in range(4):
+            store.delete_camera(f"vp_{i}")
+
+
+def test_streams_view_port_null_when_single_port(client, monkeypatch):
+    """未启用多端口（active_view_ports 为空）时 view_port 为 null，前端退回主端口。"""
+    settings = client.app.state.settings
+    monkeypatch.setattr(settings, "active_view_ports", [])
+    data = client.get("/api/v1/client/streams").json()
+    assert all(s["view_port"] is None for s in data["streams"])
+
+
+# ---------------------------------------------------------------------------
+# 批量导入（/client/sources/batch）：逐行保留各自端口、错峰启动
+# ---------------------------------------------------------------------------
+
+def test_batch_import_preserves_per_line_ports(client, monkeypatch):
+    """多端口批量导入：每行的端口必须原样保留，不能被压成同一个端口。"""
+    supervisor = client.app.state.supervisor
+    monkeypatch.setattr(supervisor, "start_camera", lambda cam: None)
+    monkeypatch.setattr("campusclear.api.client.time.sleep", lambda s: None)
+    urls = "\n".join([
+        "rtsp://u:p@10.0.0.5:8001/Streaming/Channels/101 # 教学楼-101",
+        "rtsp://u:p@10.0.0.5:8002/Streaming/Channels/101 # 教学楼-102",
+        "rtsp://u:p@10.0.0.6:554/cam/realmonitor?channel=1&subtype=0 # 宿舍-大门",
+    ])
+    store = client.app.state.store
+    try:
+        r = client.post("/api/v1/client/sources/batch", json={"urls": urls})
+        assert r.status_code == 201
+        data = r.json()
+        assert data["added"] == 3 and data["started"] == 3 and data["failed"] == 0
+        ports = set()
+        for cam in store.list_cameras():
+            hostport = cam.source_rtsp.split("@", 1)[1].split("/", 1)[0]
+            ports.add(hostport.rsplit(":", 1)[1])
+        assert ports == {"8001", "8002", "554"}
+        # 响应里不得出现明文凭证
+        assert "u:p@" not in json.dumps(data, ensure_ascii=False)
+        assert any(c.name == "教学楼-101" for c in store.list_cameras())
+    finally:
+        for c in list(store.list_cameras()):
+            store.delete_camera(c.id)
+
+
+def test_batch_import_empty_and_oversize_rejected(client):
+    """空输入与超上限（>1000 行）都必须 400，不得静默入库。"""
+    assert client.post(
+        "/api/v1/client/sources/batch", json={"urls": "  \n # x\n"}
+    ).status_code == 400
+    r = client.post("/api/v1/client/sources/batch", json={"urls": "rtsp://x\n" * 1001})
+    assert r.status_code == 400
+
+
+def test_batch_import_no_start_leaves_pipelines_down(client):
+    """start=False 只入库不启动：不应有任何真实拉流被拉起。"""
+    urls = "rtsp://u:p@10.0.0.9:9001/live/ch # 离线一路"
+    store = client.app.state.store
+    try:
+        r = client.post("/api/v1/client/sources/batch", json={"urls": urls, "start": False})
+        assert r.status_code == 201
+        data = r.json()
+        assert data["added"] == 1 and data["started"] == 0
+        assert data["items"][0]["started"] is None
+        streams = client.get("/api/v1/client/streams").json()["streams"]
+        assert all(s["online"] is False for s in streams if s["id"] != "demo")
+    finally:
+        for c in list(store.list_cameras()):
+            store.delete_camera(c.id)
