@@ -92,6 +92,12 @@
                  color:#fff;font-size:12px;padding:2px 8px;border-radius:6px}
   #compare .vtip{margin-top:10px;color:#8b97a3;font-size:12px}
   .hide{display:none!important}
+  .shot-pending{border:1px dashed var(--line);border-radius:8px;padding:10px 12px;
+                font-size:12px;color:var(--muted);background:var(--panel)}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--accent);
+        border-top-color:transparent;border-radius:50%;animation:rot .8s linear infinite;
+        vertical-align:-2px;margin-right:6px}
+  @keyframes rot{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -110,9 +116,37 @@
   <!-- 实时 -->
   <section id="view-live">
     <p class="hint">服务器（本机）实时推送的增强画面。轻量档，要跟得上帧率。演示画面为合成源，仅用于无摄像头时预览。</p>
-    <div class="toolbar"><button class="primary" onclick="toggleAdd()">＋ 连接监控服务器（添加数据源）</button></div>
+    <div class="toolbar">
+      <button class="primary" onclick="toggleAdd()">＋ 添加数据源</button>
+    </div>
+    <div id="batchPanel" class="panel hide">
+      <p class="hint" style="margin-top:0">每行一个取流地址，<b>各自端口原样保留</b>（如 rtsp://10.0.0.5:<b>8001</b>/... 与 rtsp://10.0.0.5:<b>8002</b>/... 不会混到一起）。
+         行尾可加 " # 名称" 作为通道名。导入后按 0.5 秒/路 错峰启动，避免几百路同时连接把交换机或 NVR 打挂。</p>
+      <textarea id="batchUrls" rows="8" style="width:100%;background:var(--panel2);color:var(--fg);
+        border:1px solid var(--line);border-radius:8px;padding:10px;font-size:13px;font-family:monospace"
+        placeholder="rtsp://admin:pass@10.0.0.5:8001/Streaming/Channels/101 # 教学楼-101
+rtsp://admin:pass@10.0.0.5:8002/Streaming/Channels/101 # 教学楼-102
+rtsp://admin:pass@10.0.0.6:554/cam/realmonitor?channel=1&amp;subtype=0 # 宿舍-大门"></textarea>
+      <div class="frow" style="margin-top:10px">
+        <label>启动方式
+          <select id="batchStart">
+            <option value="1" selected>导入并逐路启动</option>
+            <option value="0">只导入不启动（之后手动连）</option>
+          </select>
+        </label>
+        <button class="primary" id="batchBtn" onclick="batchImport()">导入</button>
+        <button class="ghost" onclick="toggleBatch(false)">取消</button>
+      </div>
+      <div id="batchMsg" class="status" style="margin-top:10px"></div>
+    </div>
     <div id="addPanel" class="panel hide">
       <div class="frow">
+        <label>来源
+          <select id="srcOrigin">
+            <option value="server">监控服务器（正式）</option>
+            <option value="camera">摄像头直连（测试）</option>
+          </select>
+        </label>
         <label>方式
           <select id="srcKind" onchange="onKind()">
             <option value="">直接填地址</option>
@@ -143,8 +177,24 @@
 
   <!-- 回放 -->
   <section id="view-play" class="hide">
-    <p class="hint">从服务器（本机）拉取一段录像，做重量级增强（慢一点没关系）。选好录像与档位后提交，处理完成即可播放。</p>
+    <p class="hint">从录像目录选一段录像 → 拖到目标帧 → 截图并增强（按需重量档，慢一点没关系）。
+       也可对整段做离线增强任务（重量档，产出增强 MP4）。</p>
     <div class="rec-list" id="recs"></div>
+    <div class="panel" id="recPlayerPanel" style="display:none">
+      <div class="frow" style="align-items:center">
+        <b id="recNow" style="font-size:14px">—</b>
+        <span class="spacer"></span>
+        <label>截图预设
+          <select id="recPreset"></select>
+        </label>
+        <button class="primary" id="recShotBtn" onclick="recShot()">截图并增强</button>
+      </div>
+      <video id="recVideo" controls preload="metadata" style="margin-top:12px"></video>
+      <div id="recShotStatus" class="status" style="margin-top:8px"></div>
+      <div class="result" id="recShots" style="margin-top:12px"></div>
+    </div>
+    <hr style="border-color:var(--line);margin:18px 0">
+    <p class="hint" style="margin-bottom:6px">整段离线增强（慢，产出增强 MP4）</p>
     <form class="row" onsubmit="return false">
       <label>增强档位
         <select id="mode">
@@ -191,7 +241,9 @@ async function loadStreams(){
   try{
     const d = await api("/client/streams");
     box.innerHTML = "";
+    streamPorts = {};
     d.streams.forEach(s=>{
+      streamPorts[s.id] = s.view_port || null;
       const el = document.createElement("div"); el.className = "card";
       const isDemo = s.kind === "demo";
       el.innerHTML = `
@@ -202,10 +254,11 @@ async function loadStreams(){
           <span class="spacer" style="flex:1"></span>
           <span class="rm" onclick="openCompare('${s.id}')">对比</span>
           <span class="tag ${isDemo?'demo':''}">${isDemo?'演示':'摄像头'}</span>
+          ${(!isDemo && (s.tags||[]).includes('测试')) ? '<span class="tag demo">测试</span>' : ''}
           ${isDemo ? '' : `<span class="rm" onclick="removeSource('${s.id}')">移除</span>`}
         </div>
         ${s.online
-          ? `<img title="点击进入全屏（可开增强 / 截图）" onclick="openViewer('${s.id}','${esc(s.name)}')" src="${API}/client/live/${s.id}/raw.mjpeg?t=${Date.now()}" alt="">`
+          ? `<img title="点击进入全屏（可开增强 / 截图）" onclick="openViewer('${s.id}','${esc(s.name)}',${s.sub?1:0})" src="${liveUrl(s.id, false, s.view_port)}" alt="">`
           : `<div style="aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;color:var(--muted)">离线</div>`}
       `;
       box.appendChild(el);
@@ -213,6 +266,19 @@ async function loadStreams(){
     // 还没有任何真实数据源时，直接把“连接设置”摊开，避免用户找不到入口
     if(!d.streams.some(s => s.kind === "camera")) toggleAdd(true);
   }catch(e){ box.innerHTML = '<div class="err">'+esc(e.message)+'</div>'; }
+}
+
+// ---- 多端口观看：MJPEG 长连接受浏览器「同源 ~6 并发」限制，
+// 服务端把各路轮转分配到多个本地端口，这里按端口拼图片地址 ----
+let streamPorts = {};
+function liveUrl(sid, enhanced, viewPort){
+  const path = enhanced
+    ? `${API}/client/live/${sid}.mjpeg`
+    : `${API}/client/live/${sid}/raw.mjpeg`;
+  const bust = `?t=${Date.now()}`;
+  return viewPort
+    ? `${location.protocol}//${location.hostname}:${viewPort}${path}${bust}`
+    : `${path}${bust}`;
 }
 
 async function loadRecs(){
@@ -225,14 +291,17 @@ async function loadRecs(){
     d.recordings.forEach(r=>{
       const el = document.createElement("div"); el.className = "rec";
       el.innerHTML = `<span class="name">${esc(r.name)}</span><span class="meta">${r.size_mb} MB</span>`;
-      el.onclick = ()=>{ selectedRec = r.name;
+      el.onclick = ()=>{
+        selectedRec = r.name;
         document.querySelectorAll(".rec").forEach(x=>x.classList.remove("on")); el.classList.add("on");
-        const h = document.getElementById("jobStatus"); if(h){ h.className="status"; h.textContent = "已选： " + r.name; } };
+        const h = document.getElementById("jobStatus"); if(h){ h.className="status"; h.textContent = "已选： " + r.name; }
+        openRecPlayer(r.name);
+      };
       box.appendChild(el);
     });
-    // 自动选中第一段，避免“没选就点开始增强”而毫无反应
+    // 自动选中第一段，避免"没选就点开始增强"而毫无反应
     const first = box.querySelector(".rec");
-    if(first){ selectedRec = d.recordings[0].name; first.classList.add("on"); }
+    if(first){ selectedRec = d.recordings[0].name; first.classList.add("on"); openRecPlayer(d.recordings[0].name); }
   }catch(e){ box.innerHTML = '<div class="err">'+esc(e.message)+'</div>'; }
 }
 
@@ -250,6 +319,39 @@ async function submitJob(){
     st.innerHTML = "任务已提交：" + job.id + ' <div class="bar"><i></i></div>';
     pollJob(job.id);
   }catch(e){ st.innerHTML = '<span class="err">提交失败：'+esc(e.message)+'</span>'; btn.disabled=false; }
+}
+
+// ---- 录像播放 + 截图增强 ----
+function openRecPlayer(name){
+  const panel = document.getElementById("recPlayerPanel");
+  panel.style.display = "";
+  document.getElementById("recNow").textContent = name;
+  const v = document.getElementById("recVideo");
+  v.src = `${API}/client/recordings/${encodeURIComponent(name)}/video?t=${Date.now()}`;
+  v.currentTime = 0;
+  document.getElementById("recShots").innerHTML = "";
+  document.getElementById("recShotStatus").textContent = "";
+}
+
+async function recShot(){
+  if(!selectedRec){ alert("请先在上方点选一段录像"); return; }
+  const v = document.getElementById("recVideo");
+  const t = v.currentTime || 0;
+  const sel = document.getElementById("recPreset");
+  const preset = sel.value || "forensic";
+  const presetText = (sel.selectedOptions[0] && sel.selectedOptions[0].text) || preset;
+  const labelText = `${presetText} @ ${t.toFixed(1)}s`;
+  const pending = addPendingShot("recShots", labelText);
+  document.getElementById("recShotStatus").textContent = "";
+  try{
+    const q = await api("/client/snapshot-recording", {method:"POST", body: JSON.stringify({
+      recording: selectedRec, time: t, preset, wait: false
+    })});
+    await pollStill(q.id, pending, labelText);
+  }catch(e){
+    pending.className = "shot-pending err";
+    pending.innerHTML = `${esc(labelText)} · 失败：${esc(e.message)}`;
+  }
 }
 
 async function pollJob(id){
@@ -282,6 +384,27 @@ function toggleAdd(show){
   const on = (show === undefined) ? p.classList.contains("hide") : show;
   p.classList.toggle("hide", !on);
 }
+function toggleBatch(show){
+  const p = document.getElementById("batchPanel");
+  const on = (show === undefined) ? p.classList.contains("hide") : show;
+  p.classList.toggle("hide", !on);
+}
+async function batchImport(){
+  const msg = document.getElementById("batchMsg");
+  const urls = document.getElementById("batchUrls").value;
+  if(!urls.trim()){ msg.className="err"; msg.textContent="请先粘贴取流地址（每行一个）"; return; }
+  const btn = document.getElementById("batchBtn");
+  btn.disabled = true; msg.className = "status"; msg.textContent = "导入中…";
+  try{
+    const r = await api("/client/sources/batch", {method:"POST", body: JSON.stringify({
+      urls, start: document.getElementById("batchStart").value === "1"
+    })});
+    msg.innerHTML = `已导入 ${r.added} 路，成功启动 ${r.started}` +
+      (r.failed ? `，<span class="err">失败 ${r.failed}</span>（详情见下方列表状态）` : "");
+    loadStreams();
+  }catch(e){ msg.className="err"; msg.textContent = "导入失败：" + e.message; }
+  finally{ btn.disabled = false; }
+}
 function onKind(){
   const direct = !document.getElementById("srcKind").value;
   document.getElementById("fUrl").classList.toggle("hide", !direct);
@@ -292,7 +415,8 @@ async function addSource(){
   const msg = document.getElementById("addMsg");
   msg.textContent = "连接中…"; msg.className = "status";
   const kind = document.getElementById("srcKind").value;
-  const payload = { name: document.getElementById("srcName").value.trim() };
+  const payload = { name: document.getElementById("srcName").value.trim(),
+                    kind: document.getElementById("srcOrigin").value };
   if(!kind){
     payload.url = document.getElementById("srcUrl").value.trim();
   }else{
@@ -320,21 +444,34 @@ async function removeSource(id){
 
 // ---- 全屏查看：实时增强开关 + 截图增强 ----
 let viewerId = null;
-function openViewer(id, name){
+function openViewer(id, name, sub){
   viewerId = id;
   document.getElementById("vTitle").textContent = name || id;
   document.getElementById("enhToggle").checked = true;
+  const sel = document.getElementById("streamSel");
+  if(sel) sel.value = sub ? "1" : "0";
   updateViewerSrc();
   loadShots();
   document.getElementById("viewer").classList.remove("hide");
 }
+async function setStream(){
+  if(!viewerId) return;
+  const sub = document.getElementById("streamSel").value === "1";
+  try{
+    await api(`/client/sources/${viewerId}/stream`, {method:"POST", body: JSON.stringify({sub})});
+    // 等管线切到新码流并产出新帧，再重连画面
+    setTimeout(updateViewerSrc, 2500);
+  }catch(e){ alert("切换码流失败：" + e.message); }
+}
 function updateViewerSrc(){
   if(!viewerId) return;
   const enh = document.getElementById("enhToggle").checked;
-  const bust = Date.now();
-  document.getElementById("viewerImg").src = enh
-    ? `${API}/client/live/${viewerId}.mjpeg?t=${bust}`
-    : `${API}/client/live/${viewerId}/raw.mjpeg?t=${bust}`;
+  // 直接改 <img>.src 去切换 MJPEG 流时，浏览器容易卡住/不刷新；换成新的 <img> 元素最稳。
+  const old = document.getElementById("viewerImg");
+  const img = document.createElement("img");
+  img.id = "viewerImg"; img.alt = "";
+  img.src = liveUrl(viewerId, enh, streamPorts[viewerId]);
+  old.replaceWith(img);
 }
 function closeViewer(){
   document.getElementById("viewer").classList.add("hide");
@@ -342,22 +479,83 @@ function closeViewer(){
   viewerId = null;
   if(document.fullscreenElement) document.exitFullscreen().catch(()=>{});
 }
+// 截图不再占用按钮：点一次立刻在列表顶部放一张「处理中」占位卡，
+// 完成后原位替换成结果图。这样连续截图不用等上一张跑完。
+function addPendingShot(boxId, label){
+  const box = document.getElementById(boxId);
+  const el = document.createElement("div");
+  el.className = "shot-pending";
+  el.innerHTML = `<span class="spin"></span>${esc(label)} · 处理中…`;
+  box.prepend(el);
+  return el;
+}
+function shotCardHtml(item){
+  const extra = [item.size, item.elapsed ? (item.elapsed/1000).toFixed(1) + "s" : ""].filter(Boolean).join(" · ");
+  return `<img src="${esc(item.url)}?t=${Date.now()}" title="点击放大" onclick="openLightbox(this.src)">
+    <div class="sitem">${esc(item.label || "")}${extra ? (" · " + extra) : ""}</div>`;
+}
+
+// 截图任务轮询：服务端串行跑增强（一张 10~70 秒），这里只负责把状态贴到占位卡上。
+// 用「提交 → 轮询」而不是「发一个长请求等结果」：后者会让浏览器为每张截图占住
+// 一条连接（同源上限 6 条），连点几下就把整个页面的其它请求一起堵死。
+async function pollStill(jobId, pending, labelText){
+  const startedAt = Date.now();
+  for(;;){
+    await new Promise(r => setTimeout(r, 400));
+    const secs = ((Date.now() - startedAt) / 1000).toFixed(0);
+    let job;
+    try{ job = await api(`/client/snapshot-jobs/${jobId}`); }
+    catch(e){
+      pending.className = "shot-pending err";
+      pending.innerHTML = `${esc(labelText)} · 查询状态失败：${esc(e.message)}`;
+      return;
+    }
+    if(job.state === "queued"){
+      pending.innerHTML = `<span class="spin"></span>${esc(labelText)} · 排队中` +
+        (job.position ? `（第 ${job.position} 位）` : "") + ` · ${secs}s`;
+      continue;
+    }
+    if(job.state === "running"){
+      pending.innerHTML = `<span class="spin"></span>${esc(labelText)} · 增强中 · ${secs}s`;
+      continue;
+    }
+    if(job.state === "done" && job.result){
+      const r = job.result;
+      pending.className = "";
+      pending.style.cssText = "display:inline-block;margin:0 12px 12px 0;vertical-align:top;max-width:280px";
+      pending.innerHTML = shotCardHtml({url: r.url, label: r.label || labelText,
+                                        size: r.width + "×" + r.height, elapsed: job.elapsed_ms});
+      return;
+    }
+    pending.className = "shot-pending err";
+    pending.innerHTML = `${esc(labelText)} · 失败：${esc(job.error || "未知原因")}`;
+    return;
+  }
+}
+
 async function takeShot(){
   if(!viewerId) return;
-  const preset = document.getElementById("shotPreset").value || "standard";
-  const btn = document.getElementById("shotBtn");
-  const old = btn.textContent; btn.disabled = true; btn.textContent = "处理中…";
+  const sel = document.getElementById("shotPreset");
+  const preset = sel.value || "standard";
+  const presetText = (sel.selectedOptions[0] && sel.selectedOptions[0].text) || preset;
+  const hiRes = document.getElementById("shotHiRes");
+  // 点击立即出占位卡，不等服务端：这样连点也不会卡住界面
+  const pending = addPendingShot("shotList", `${presetText} · 实时抓帧`);
   try{
-    const r = await api("/client/snapshot", {method:"POST", body: JSON.stringify({stream_id: viewerId, preset})});
-    addShot({url: r.url, label: r.label || preset, size: r.width + "×" + r.height});
-  }catch(e){ alert("截图增强失败：" + e.message); }
-  finally{ btn.disabled = false; btn.textContent = old; }
+    const q = await api("/client/snapshot", {method:"POST", body: JSON.stringify({
+      stream_id: viewerId, preset, wait: false,
+      source: (hiRes && hiRes.checked) ? "camera" : "pipeline"
+    })});
+    await pollStill(q.id, pending, `${presetText} · 实时抓帧`);
+  }catch(e){
+    pending.className = "shot-pending err";
+    pending.innerHTML = `${esc(presetText)} · 失败：${esc(e.message)}`;
+  }
 }
 function addShot(item){
   const box = document.getElementById("shotList");
   const el = document.createElement("div");
-  el.innerHTML = `<img src="${esc(item.url)}?t=${Date.now()}" title="点击放大" onclick="openLightbox(this.src)">
-    <div class="sitem">${esc(item.label || "")}${item.size ? (" · " + item.size) : ""}</div>`;
+  el.innerHTML = shotCardHtml(item);
   box.prepend(el);
 }
 async function loadShots(){
@@ -372,9 +570,11 @@ function openLightbox(src){
 async function loadPresets(){
   try{
     const d = await api("/client/presets");
-    const sel = document.getElementById("shotPreset");
-    sel.innerHTML = d.presets.map(p => `<option value="${p.key}">${esc(p.label)}</option>`).join("");
-    sel.value = "standard";
+    const html = d.presets.map(p => `<option value="${p.key}">${esc(p.label)}</option>`).join("");
+    const live = document.getElementById("shotPreset");
+    live.innerHTML = html; live.value = "standard";
+    const rec = document.getElementById("recPreset");
+    if(rec){ rec.innerHTML = html; rec.value = "forensic"; }  // 录像截图默认用最重的取证档
   }catch(e){}
 }
 document.addEventListener("keydown", e=>{
@@ -387,9 +587,9 @@ document.addEventListener("keydown", e=>{
 
 // 原图 / 增强 对比
 function openCompare(id){
-  const bust = Date.now();
-  document.getElementById("cmpRaw").src = `${API}/client/live/${id}/raw.mjpeg?t=${bust}`;
-  document.getElementById("cmpEnh").src = `${API}/client/live/${id}.mjpeg?t=${bust}`;
+  const vp = streamPorts[id] || null;
+  document.getElementById("cmpRaw").src = liveUrl(id, false, vp);
+  document.getElementById("cmpEnh").src = liveUrl(id, true, vp);
   document.getElementById("compare").classList.remove("hide");
 }
 function closeCompare(){
@@ -407,8 +607,17 @@ loadPresets();
 <div id="viewer" class="hide">
   <div class="vbar" onclick="event.stopPropagation()">
     <b id="vTitle">实时</b>
-    <label class="vtoggle"><input type="checkbox" id="enhToggle" checked onchange="updateViewerSrc()"> 实时增强</label>
+    <label class="vtoggle">实时增强<input type="checkbox" id="enhToggle" checked onchange="updateViewerSrc()"></label>
+    <label class="vtoggle">码流
+      <select id="streamSel" onchange="setStream()">
+        <option value="0">主码流（清晰）</option>
+        <option value="1">子码流（流畅）</option>
+      </select>
+    </label>
     <select id="shotPreset"></select>
+    <label class="vtoggle" title="默认用管线里现成的帧，毫秒级；勾选后另开一路主码流抓原始高清帧，慢且可能影响预览">
+      高清抓帧<input type="checkbox" id="shotHiRes">
+    </label>
     <button class="primary" id="shotBtn" onclick="takeShot()">截图并增强</button>
     <span class="spacer"></span>
     <button class="ghost" onclick="closeViewer()">关闭</button>
