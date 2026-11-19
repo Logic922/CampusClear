@@ -366,6 +366,9 @@ class OnnxEnhancer:
         tile_side = int((self.tile_max_pixels) ** 0.5)
         tile_side = max(64, min(tile_side, max(height, width)))
         step = tile_side - overlap
+        # 用「模型实际输出倍率」而不是「请求倍率」：ONNX 超分模型可能原生 4×，
+        # 而调用方请求的是 2×；若按请求倍率回贴，会与模型输出尺寸对不上而崩溃。
+        mscale = loaded.spec.scale if getattr(loaded.spec, "scale", 1) > 1 else scale
         output = None
 
         for y0 in range(0, height, step):
@@ -377,14 +380,14 @@ class OnnxEnhancer:
 
                 if output is None:
                     output = np.zeros(
-                        (height * scale, width * scale, 3), dtype=np.uint8
+                        (height * mscale, width * mscale, 3), dtype=np.uint8
                     )
 
                 # 裁剪重叠区，只保留本块的「核心」区域，避免缝线
                 pad_top = overlap if y0 > 0 else 0
                 pad_left = overlap if x0 > 0 else 0
-                core = tile_out[pad_top * scale :, pad_left * scale :]
-                ty, tx = (y0 + pad_top) * scale, (x0 + pad_left) * scale
+                core = tile_out[pad_top * mscale :, pad_left * mscale :]
+                ty, tx = (y0 + pad_top) * mscale, (x0 + pad_left) * mscale
                 output[ty : ty + core.shape[0], tx : tx + core.shape[1]] = core
 
         if output is None:  # pragma: no cover - 理论上不会发生
@@ -457,6 +460,11 @@ class OnnxEnhancer:
         - 色度信息本身带宽低、人眼不敏感，插值几乎无损；
         - 避免生成式超分在色度上产生的偏色，保证与原有安防平台色调一致。
         """
+        # 1× 不需要超分：模型原生倍率可能是 4×，跑完再缩回去纯属浪费算力
+        # （ECONOMY 档会把 scale 降到 1，正是这种情况）。
+        if scale <= 1:
+            return frame
+
         region = self._resolve_region(frame, roi)
         top, left, bottom, right = region
         is_full = region == (0, 0, frame.shape[0], frame.shape[1])
@@ -472,7 +480,20 @@ class OnnxEnhancer:
             return frame
         enhanced_y = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
 
-        target_size = (enhanced_y.shape[1], enhanced_y.shape[0])
+        # 模型原生倍率不一定等于调用方请求的倍率（例如清单里是 4×、计划里
+        # 请求 2×）。必须在这里归一到「请求倍率」，否则下游 rawvideo 管道
+        # 会按错误的帧长切分字节流，输出表现为撕裂/错位而非黑屏，极难排查。
+        target_width = patch.shape[1] * scale
+        target_height = patch.shape[0] * scale
+        if (enhanced_y.shape[1], enhanced_y.shape[0]) != (target_width, target_height):
+            interpolation = (
+                cv2.INTER_AREA if enhanced_y.shape[1] > target_width else cv2.INTER_CUBIC
+            )
+            enhanced_y = cv2.resize(
+                enhanced_y, (target_width, target_height), interpolation=interpolation
+            )
+
+        target_size = (target_width, target_height)
         cr_up = cv2.resize(cr_channel, target_size, interpolation=cv2.INTER_CUBIC)
         cb_up = cv2.resize(cb_channel, target_size, interpolation=cv2.INTER_CUBIC)
 
