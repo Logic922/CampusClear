@@ -15,6 +15,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from ..compat import run_kwargs
+
 
 @dataclass
 class StreamMetrics:
@@ -54,17 +56,15 @@ class StreamMetrics:
     # ------------------------------------------------------------------ #
     @property
     def avg_latency_ms(self) -> float:
-        if not self._latencies:
-            return 0.0
-        return sum(self._latencies) / len(self._latencies) * 1000.0
+        with self._lock:
+            values = list(self._latencies)
+        return _average_ms(values)
 
     @property
     def p95_latency_ms(self) -> float:
-        if not self._latencies:
-            return 0.0
-        ordered = sorted(self._latencies)
-        index = min(len(ordered) - 1, int(len(ordered) * 0.95))
-        return ordered[index] * 1000.0
+        with self._lock:
+            values = list(self._latencies)
+        return _percentile_ms(values, 0.95)
 
     @property
     def effective_fps(self) -> float:
@@ -82,8 +82,13 @@ class StreamMetrics:
         return self.frames_reused / total if total else 0.0
 
     def snapshot(self) -> dict:
+        # worker 线程会持续 append 延迟/写 stage_usage；这里必须一次性拷贝
+        # 再计算，否则 sorted(deque) 可能抛 "deque mutated during iteration"，
+        # 让 /system/metrics 偶发 500。
         with self._lock:
             reasons = list(self._plan_reasons)[-1:] or [""]
+            latencies = list(self._latencies)
+            stage_usage = dict(self.stage_usage)
         return {
             "camera_id": self.camera_id,
             "uptime_seconds": round(time.time() - self.started_at, 1),
@@ -93,15 +98,27 @@ class StreamMetrics:
             "frames_reused": self.frames_reused,
             "frames_written": self.frames_written,
             "effective_fps": round(self.effective_fps, 2),
-            "avg_latency_ms": round(self.avg_latency_ms, 2),
-            "p95_latency_ms": round(self.p95_latency_ms, 2),
+            "avg_latency_ms": round(_average_ms(latencies), 2),
+            "p95_latency_ms": round(_percentile_ms(latencies, 0.95), 2),
             "drop_ratio": round(self.drop_ratio, 4),
             "reuse_ratio": round(self.reuse_ratio, 4),
             "reconnects": self.reconnects,
-            "stage_usage": dict(self.stage_usage),
+            "stage_usage": stage_usage,
             "last_plan": reasons[0],
             "last_error": self.last_error,
         }
+
+
+def _average_ms(values: list[float]) -> float:
+    return (sum(values) / len(values) * 1000.0) if values else 0.0
+
+
+def _percentile_ms(values: list[float], ratio: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(len(ordered) * ratio))
+    return ordered[index] * 1000.0
 
 
 # --------------------------------------------------------------------------- #
@@ -109,6 +126,9 @@ class StreamMetrics:
 # --------------------------------------------------------------------------- #
 _GPU_LOCK = threading.Lock()
 _GPU_AVAILABLE = True
+# nvidia-smi 偶发超时/驱动忙时不能永久放弃采集，否则负载治理从此只看队列。
+_GPU_RETRY_AT = 0.0
+_GPU_RETRY_SECONDS = 60.0
 
 
 def read_gpu_util(device_id: int = 0) -> dict | None:
@@ -116,11 +136,18 @@ def read_gpu_util(device_id: int = 0) -> dict | None:
 
     优先使用 ``nvidia-smi``（CUDA 镜像里必然存在，无需额外 Python 依赖）；
     不可用时返回 None，由上层按「无观测」处理，绝不因此报错或阻塞出流。
+
+    「没有 nvidia-smi」才永久关闭采集；超时、驱动忙、临时非零返回只做
+    60 秒冷却后重试。原实现一次超时就把 GPU 观测永久关掉，负载治理会
+    在全系统最需要它的时候失效。
     """
-    global _GPU_AVAILABLE
+    global _GPU_AVAILABLE, _GPU_RETRY_AT
     if not _GPU_AVAILABLE:
         return None
+    now = time.monotonic()
     with _GPU_LOCK:
+        if now < _GPU_RETRY_AT:
+            return None
         if shutil.which("nvidia-smi") is None:
             _GPU_AVAILABLE = False
             return None
@@ -136,13 +163,15 @@ def read_gpu_util(device_id: int = 0) -> dict | None:
                 text=True,
                 timeout=3,
                 check=False,
+                **run_kwargs(),
             )
         except (OSError, subprocess.TimeoutExpired):
-            _GPU_AVAILABLE = False
+            _GPU_RETRY_AT = time.monotonic() + _GPU_RETRY_SECONDS
             return None
         if result.returncode != 0:
-            _GPU_AVAILABLE = False
+            _GPU_RETRY_AT = time.monotonic() + _GPU_RETRY_SECONDS
             return None
+        _GPU_RETRY_AT = 0.0
         line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
         parts = [piece.strip() for piece in line.split(",")]
         if len(parts) < 4:
