@@ -9,9 +9,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .compat import cpu_only, find_ffmpeg, resolve_providers
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -42,7 +47,10 @@ def _bool(key: str, default: bool) -> bool:
 
 def _providers(key: str, default: list[str]) -> list[str]:
     raw = _str(key, ",".join(default))
-    return [item.strip() for item in raw.split(",") if item.strip()]
+    requested = [item.strip() for item in raw.split(",") if item.strip()]
+    # 收敛到本机真正可用的提供器：Windows 内网机常见「配置写着 CUDA/TensorRT，
+    # 实际只装了 CPU 版 onnxruntime」，不收敛会在建会话时反复告警甚至报错。
+    return resolve_providers(requested)
 
 
 DEFAULT_PROVIDERS = [
@@ -61,6 +69,13 @@ class Settings:
     api_prefix: str = field(default_factory=lambda: _str("CAMPUSCLEAR_API_PREFIX", "/api/v1"))
     host: str = field(default_factory=lambda: _str("CAMPUSCLEAR_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: _int("CAMPUSCLEAR_PORT", 8000))
+    # 浏览器**额外查看端口**数量。MJPEG 是不关闭的长连接，而浏览器对同一
+    # 「协议+主机+端口」只允许约 6 条并发连接——所有路挤一个端口时，在线路
+    # 一超过 6 条，后面的画面就永远排队打不开。多开几个本地端口把观看流量
+    # 分散开（每个端口 6 个名额）。0 = 关闭（退回单端口）。
+    view_port_count: int = field(default_factory=lambda: _int("CAMPUSCLEAR_VIEW_PORTS", 4))
+    # 实际启动成功的额外查看端口（app.py 启动后回填；list_streams 用它做轮转分配）
+    active_view_ports: list[int] = field(default_factory=list)
     tls_cert: str = field(default_factory=lambda: _str("CAMPUSCLEAR_TLS_CERT", ""))
     tls_key: str = field(default_factory=lambda: _str("CAMPUSCLEAR_TLS_KEY", ""))
     # 管理面是否强制走 HTTPS（内网自签 CA）。生产环境建议开启。
@@ -135,16 +150,49 @@ class Settings:
     rtsp_output_password: str = field(
         default_factory=lambda: _str("CAMPUSCLEAR_RTSP_OUTPUT_PASSWORD", "")
     )
-    ffmpeg_bin: str = field(default_factory=lambda: _str("CAMPUSCLEAR_FFMPEG", "ffmpeg"))
+    ffmpeg_bin: str = field(
+        default_factory=lambda: _str("CAMPUSCLEAR_FFMPEG", find_ffmpeg())
+    )
+    # 是否把增强结果回推成 RTSP 流。
+    # 服务器形态下配内网 MediaMTX，让「既有安防平台零改造」；
+    # 单机客户端形态下内网并没有 RTSP 网关，开着只会不停重建必然失败的推流进程。
+    output_enabled: bool = field(
+        default_factory=lambda: _bool("CAMPUSCLEAR_OUTPUT_ENABLED", True)
+    )
+    # 解码端强制缩放到 reader 的宽高，保证 rawvideo 管道帧长恒定 ——
+    # 这是「探测不到流参数时画面撕裂成雪花」的根治手段。
+    force_decode_size: bool = field(
+        default_factory=lambda: _bool("CAMPUSCLEAR_FORCE_DECODE_SIZE", True)
+    )
+    # 解码分辨率上限（0 = 不限制）。增强耗时大致随像素数线性增长：
+    # 纯 CPU 机器上 720p 全流程约 3 fps，4MP（2560x1440）会掉到 1 fps 以下。
+    # 把上限设成 1280（宽）能让画面「动起来」，代价是增强后的分辨率也止步于此。
+    max_decode_width: int = field(
+        default_factory=lambda: _int("CAMPUSCLEAR_MAX_DECODE_WIDTH", 0)
+    )
+    max_decode_height: int = field(
+        default_factory=lambda: _int("CAMPUSCLEAR_MAX_DECODE_HEIGHT", 0)
+    )
     # RTSP 接收超时（微秒）。内网交换机瞬断时靠它触发重连。
     rtsp_timeout_us: int = field(
         default_factory=lambda: _int("CAMPUSCLEAR_RTSP_TIMEOUT_US", 5_000_000)
+    )
+    # RTSP 传输方式：tcp / udp。绝大多数内网摄像头走 tcp 更稳；
+    # 某些老 NVR 或组播环境只支持 udp，现场可用环境变量切换。
+    rtsp_transport: str = field(
+        default_factory=lambda: _str("CAMPUSCLEAR_RTSP_TRANSPORT", "tcp").lower()
     )
     reconnect_backoff_seconds: list[int] = field(
         default_factory=lambda: [
             _int("CAMPUSCLEAR_RECONNECT_BASE_SECONDS", 1),
             _int("CAMPUSCLEAR_RECONNECT_MAX_SECONDS", 30),
         ]
+    )
+    # 多通道**错峰启动**间隔（秒）。同时接入多路时如果一起发起 probe+connect，
+    # 交换机/NVR/流媒体服务器的并发会话会被瞬间打满，表现为「所有路都打不开」。
+    # 每启动一路停一小会儿，让前一路完成 RTSP 握手再上下一路。
+    start_stagger_seconds: float = field(
+        default_factory=lambda: _float("CAMPUSCLEAR_START_STAGGER_SECONDS", 0.5)
     )
 
     # ---------------- 增强策略 ----------------
@@ -191,8 +239,10 @@ class Settings:
         default_factory=lambda: _int("CAMPUSCLEAR_HEALTH_INTERVAL", 20)
     )
     # 连续 N 次判定为「画面冻结」即触发重启
+    # 默认 150 帧：25fps 下约 6 秒。原先的 3 帧（120ms）对静态场景的安防摄像头
+    # 会频繁误触发，且 worker 线程直接调 reconnect 会导致与 reader 线程竞态。
     frozen_frame_restart_times: int = field(
-        default_factory=lambda: _int("CAMPUSCLEAR_FROZEN_RESTART_TIMES", 3)
+        default_factory=lambda: _int("CAMPUSCLEAR_FROZEN_RESTART_TIMES", 150)
     )
 
     def __post_init__(self) -> None:
@@ -204,6 +254,35 @@ class Settings:
             self.trt_engine_cache_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
+
+        if self.rtsp_transport not in ("tcp", "udp"):
+            logger.warning(
+                "CAMPUSCLEAR_RTSP_TRANSPORT=%r 无效，已回退 tcp（可选 tcp/udp）",
+                self.rtsp_transport,
+            )
+            self.rtsp_transport = "tcp"
+
+        # CPU 执行提供器不支持 fp16：与其让 onnxruntime 在建会话时反复报错，
+        # 不如在这里直接收敛，把「配置矛盾」降级成一条日志。
+        if self.use_fp16 and cpu_only(self.providers):
+            logger.info("本机仅有 CPU 执行提供器，已自动关闭 fp16（CAMPUSCLEAR_USE_FP16 被覆盖）")
+            self.use_fp16 = False
+
+        # 纯 CPU 部署且未设解码上限时，自动把解码尺寸限制到 1280 宽。
+        # 不限的话接入主码流（如海康 2560x1440 H.265）后，单帧增强要数分钟，
+        # 预览会「冻住」、队列长期满载。1280 宽下全流程仍能跑动，且
+        # 「截图并增强」走独立的按需抓帧，依旧拿到主码流原始分辨率。
+        # 如需解除限制，把 CAMPUSCLEAR_MAX_DECODE_WIDTH 设成一个大值（如 7680）。
+        if (
+            cpu_only(self.providers)
+            and self.max_decode_width == 0
+            and self.max_decode_height == 0
+        ):
+            logger.info(
+                "纯 CPU 部署且未设置解码上限，自动限制解码宽度为 1280"
+                "（接入主码流时保护预览流畅；解除限制可设 CAMPUSCLEAR_MAX_DECODE_WIDTH=7680）"
+            )
+            self.max_decode_width = 1280
 
     # ---------------- 派生属性 ----------------
     @property
