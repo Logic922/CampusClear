@@ -158,6 +158,10 @@ def build_plan(
     # ---- ECONOMY 档位：降倍率 ----
     if level is LoadLevel.ECONOMY:
         plan.scale = 1 if policy.base_scale <= 2 else 2
+        if plan.scale == 1 and plan.run_sr:
+            # 超分模型的原生倍率是固定的（如 realesr ×4），请求 1× 它也会
+            # 照跑全量推理再把结果缩回去——纯浪费算力。倍率降到 1 时直接关掉。
+            plan.run_sr = False
         reasons.append("负载达 ECONOMY 档，超分倍率下调")
     else:
         plan.scale = policy.base_scale
