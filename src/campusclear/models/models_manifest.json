@@ -30,13 +30,13 @@
       "source": "公开发布权重经通道裁剪后离线转换 ONNX"
     },
     "sr": {
-      "file": "realesr_general_x2v3.onnx",
+      "file": "realesr_general_x4v3.onnx",
       "sha256": "",
       "input_size": null,
-      "scale": 2,
-      "fp16": true,
-      "description": "通用图像超分（Real-ESRGAN general 系列 x2 轻量版），面向压缩损伤与细节缺失，兼顾画质与实时性",
-      "source": "公开发布权重离线转换为固定 scale ONNX"
+      "scale": 4,
+      "fp16": false,
+      "description": "通用图像超分（Real-ESRGAN general-x4v3，SRVGGNetCompact 4×），面向压缩损伤与细节缺失；输出由增强器按计划倍率归一",
+      "source": "HF Heliosoph/realesrgan-onnx；原始权重 xinntao/Real-ESRGAN（BSD-3-Clause）"
     }
   }
 }
